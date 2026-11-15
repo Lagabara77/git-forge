@@ -68,11 +68,11 @@ export function decodePktLines(buffer: Buffer): Pkt[] {
   return out;
 }
 
-/** The data payloads of a pkt-line stream, as strings (flush/delim skipped). */
+/** The data payloads of a pkt-line stream, as strings (flush/delim skipped, trailing newline stripped). */
 export function pktStrings(buffer: Buffer): string[] {
   return decodePktLines(buffer)
     .filter((pkt) => pkt.kind === 'data')
-    .map((pkt) => pkt.payload.toString('utf8'));
+    .map((pkt) => pkt.payload.toString('utf8').replace(/\r?\n$/, ''));
 }
 
 /** Split a receive-pack body into command lines and the raw pack that follows. */
@@ -326,6 +326,7 @@ export function selectFetch(
   }
   const includedCommits = new Set<string>();
   const shallowOut: string[] = [];
+  const shallowSet = new Set(shallowLines);
   const visited = new Set<string>();
   const queue: [string, number][] = [];
   for (const want of wants) {
@@ -339,9 +340,16 @@ export function selectFetch(
     head += 1;
     if (visited.has(oid)) continue;
     visited.add(oid);
-    if (exclusion.has(oid)) continue;
     const obj = getObject(oid);
     if (!obj || obj.type !== 'commit') continue;
+    if (exclusion.has(oid) && !shallowSet.has(oid)) continue;
+    if (exclusion.has(oid)) {
+      // Held but shallow: the client has this commit and not its parents, so
+      // a deepen descends past it (unless the depth limit is already met).
+      if (depth !== null && dist >= depth) continue;
+      for (const parent of parseCommit(obj.data).parents) queue.push([parent, dist + 1]);
+      continue;
+    }
     includedCommits.add(oid);
     if (depth !== null && dist >= depth) {
       shallowOut.push(oid);
@@ -354,7 +362,7 @@ export function selectFetch(
     const obj = getObject(shallowOid);
     if (obj && obj.type === 'commit') {
       const parents = parseCommit(obj.data).parents;
-      if (parents.every((parent) => includedCommits.has(parent))) unshallowOut.push(shallowOid);
+      if (parents.length > 0 && parents.every((parent) => includedCommits.has(parent))) unshallowOut.push(shallowOid);
     }
   }
   const objects = new Map<string, GitObject>();
@@ -412,11 +420,11 @@ function headOid(repo: Repo): string {
   return repo.refs.get('refs/heads/main') ?? ZERO_OID;
 }
 
-function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
-  const caps = service === 'upload-pack'
+function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const caps = service === 'git-upload-pack'
     ? 'symref=HEAD:refs/heads/main multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag agent=forge/1.0'
     : 'symref=HEAD:refs/heads/main report-status side-band-64k delete-refs ofs-delta agent=forge/1.0';
-  const parts: Buffer[] = [pktLine(`# service=git-${service}\n`), PKT_FLUSH];
+  const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const refs = sortedRefs(repo);
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
@@ -424,7 +432,7 @@ function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): B
     parts.push(pktLine(`${headOid(repo)} HEAD\0${caps}\n`));
     for (const ref of refs) {
       parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
-      if (service === 'upload-pack' && ref.name.startsWith('refs/tags/')) {
+      if (service === 'git-upload-pack' && ref.name.startsWith('refs/tags/')) {
         const peeled = peeledCommit(repo, ref.oid);
         if (peeled && peeled !== ref.oid) parts.push(pktLine(`${peeled} ${ref.name}^{}\n`));
       }
@@ -446,8 +454,8 @@ function v2Advertisement(): Buffer {
 }
 
 /** The info/refs advertisement for a service, in v0 or v2 as requested. */
-export function advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack', version2: boolean): Buffer {
-  if (service === 'receive-pack') return v0Advertisement(repo, service);
+export function advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', version2: boolean): Buffer {
+  if (service === 'git-receive-pack') return v0Advertisement(repo, service);
   return version2 ? v2Advertisement() : v0Advertisement(repo, service);
 }
 

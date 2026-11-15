@@ -19,6 +19,7 @@ import {
   flattenTree,
   buildTreeFromPaths,
   parseCommit,
+  parseTree,
   walkCommits,
 } from './store.ts';
 import { advertisement, handleReceivePack, handleUploadPack } from './git.ts';
@@ -546,16 +547,13 @@ export function createApp(store: Store) {
       const targetBranch = String(parsed.value.branch ?? repo.defaultBranch);
       let branchTip = repo.refs.get(`refs/heads/${targetBranch}`);
       if (!branchTip) {
-        const defaultTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-        if (!defaultTip) {
-          sendJson(response, 422, { message: 'No default branch to base the new branch on' });
-          return;
-        }
-        repo.refs.set(`refs/heads/${targetBranch}`, defaultTip);
-        branchTip = defaultTip;
+        // A branch that does not exist starts at the default branch tip; a
+        // repository with no commits at all starts with a root commit.
+        branchTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
+        if (branchTip) repo.refs.set(`refs/heads/${targetBranch}`, branchTip);
       }
       const content = Buffer.from(String(parsed.value.content ?? ''), 'base64');
-      const files = resolveTreeForTip(repo, branchTip);
+      const files = branchTip ? resolveTreeForTip(repo, branchTip) : new Map<string, { oid: string; mode: string }>();
       const existing = files.get(path);
       if (existing && typeof parsed.value.sha === 'string' && parsed.value.sha !== existing.oid) {
         sendJson(response, 409, { message: 'sha does not match the current file' });
@@ -566,7 +564,7 @@ export function createApp(store: Store) {
       files.set(path, { oid: blobOid, mode: '100644' });
       const treeOid = buildTreeFromPaths((type, data) => store.storeObject(repo, type, data), files);
       const message = String(parsed.value.message ?? `Update ${path}`);
-      const commitOid = store.makeCommit(repo, treeOid, [branchTip], message);
+      const commitOid = store.makeCommit(repo, treeOid, branchTip ? [branchTip] : [], message);
       repo.refs.set(`refs/heads/${targetBranch}`, commitOid);
       sendJson(response, isUpdate ? 200 : 201, {
         content: { name: path.split('/').pop(), path, sha: blobOid, size: content.length, encoding: 'base64' },

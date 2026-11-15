@@ -456,15 +456,6 @@ export interface Repo {
   issueJsonCache: Map<number, string>;
 }
 
-const DEFAULT_LABELS: Label[] = [
-  { name: 'bug', color: 'd73a4a' },
-  { name: 'enhancement', color: 'a2eeef' },
-  { name: 'documentation', color: '0075ca' },
-  { name: 'question', color: 'd876e3' },
-  { name: 'good first issue', color: '7057ff' },
-  { name: 'help wanted', color: '008672' },
-];
-
 /** A three-way merge-base diff between two trees. */
 export function diffTrees(
   getObject: (oid: string) => GitObject | undefined,
@@ -555,7 +546,7 @@ export class Store {
       objects: new Map(),
       issues: [],
       pulls: [],
-      labels: new Map(DEFAULT_LABELS.map((label) => [label.name, { ...label }])),
+      labels: new Map(),
       numberCounter: 1,
       issueJsonCache: new Map(),
     };
@@ -638,10 +629,15 @@ export class Store {
     return { treeOid, files };
   }
 
+  /** The base branch's current tip (a PR's recorded base sha goes stale once the base moves). */
+  currentBaseSha(repo: Repo, pull: Pull): string {
+    return this.branchTip(repo, pull.baseRef) ?? pull.baseSha;
+  }
+
   /** Compute a PR's file list (base tree vs head tree, via the merge-base). */
   pullFiles(repo: Repo, pull: Pull): FileChange[] {
     const getObject = (oid: string) => this.getObject(repo, oid);
-    const base = this.mergeBase(repo, pull.baseSha, pull.headSha);
+    const base = this.mergeBase(repo, this.currentBaseSha(repo, pull), pull.headSha);
     const baseTree = base ? parseCommit((getObject(base) as GitObject).data).tree : null;
     const headTree = parseCommit((getObject(pull.headSha) as GitObject).data).tree;
     return diffTrees(getObject, baseTree, headTree);
@@ -649,7 +645,7 @@ export class Store {
 
   /** MERGEABLE when the head merges cleanly onto the base, else CONFLICTING. */
   pullMergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTING' {
-    return this.mergeTrees(repo, pull.baseSha, pull.headSha) === null ? 'CONFLICTING' : 'MERGEABLE';
+    return this.mergeTrees(repo, this.currentBaseSha(repo, pull), pull.headSha) === null ? 'CONFLICTING' : 'MERGEABLE';
   }
 
   createIssue(repo: Repo, title: string, body: string, labels: string[]): Issue | { error: string } {
@@ -703,16 +699,18 @@ export class Store {
   /** Squash-merge a pull onto its base branch. Returns the merge commit or an error. */
   mergePull(repo: Repo, pull: Pull): { sha: string } | { error: string; status: number } {
     if (pull.state !== 'open') return { error: 'Pull request is already closed', status: 405 };
-    const merged = this.mergeTrees(repo, pull.baseSha, pull.headSha);
+    const baseTip = this.currentBaseSha(repo, pull);
+    const merged = this.mergeTrees(repo, baseTip, pull.headSha);
     if (merged === null) return { error: 'Merge conflict', status: 405 };
     const sec = this.clock.stamp();
     const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}`;
-    const commit = this.makeCommit(repo, merged.treeOid, [pull.baseSha], message);
+    const commit = this.makeCommit(repo, merged.treeOid, [baseTip], message);
     repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedSec = sec;
     pull.mergeSha = commit;
+    pull.baseSha = commit;
     pull.updatedSec = sec;
     return { sha: commit };
   }
