@@ -6,7 +6,7 @@
 import { createApp } from './app.ts';
 import { Store } from './store.ts';
 
-const envUrl = process.env.MAKEFUN_ENV_URL;
+const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (!envUrl) {
   console.error('MAKEFUN_ENV_URL is not set; there is no environment to register with.');
   process.exit(1);

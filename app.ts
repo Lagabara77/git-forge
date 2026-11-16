@@ -121,7 +121,13 @@ export function createApp(store: Store) {
     const method = request.method ?? 'GET';
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     const path = url.pathname;
-    const segments = path.split('/').filter((part) => part.length > 0).map((part) => decodeURIComponent(part));
+    const segments = path.split('/').filter((part) => part.length > 0).map((part) => {
+      try {
+        return decodeURIComponent(part);
+      } catch {
+        return part;
+      }
+    });
 
     if (method === 'GET' && path === '/healthz') {
       sendJson(response, 200, { ok: true });

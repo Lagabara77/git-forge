@@ -167,8 +167,39 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
  * `expectedSize`. inflateSync ignores trailing bytes and throws on a cut
  * stream, so the stream's end is the smallest prefix that inflates cleanly
  * to the expected size; it is found by binary search.
+ *
+ * Fast path (Node >= 20.15 / 22.2): `inflateSync(buf, { info: true })`
+ * returns `{ buffer, engine }` and `engine.bytesWritten` is the number of
+ * compressed bytes the stream consumed — one inflate instead of ~log2(n).
+ * Feature-detected once at import; any doubt falls back to binary search.
  */
+const HAS_INFLATE_INFO: boolean = (() => {
+  try {
+    // A real zlib-wrapped empty stream from deflateSync (8 bytes, header
+    // 78 9c). A hand-written raw deflate stream is NOT valid here: the
+    // sync API expects the zlib wrapper and throws Z_DATA_ERROR on it.
+    const probe = inflateSync(deflateSync(Buffer.alloc(0)), { info: true }) as unknown as { buffer?: Buffer; engine?: { bytesWritten?: unknown } };
+    return typeof probe === 'object' && probe !== null && typeof probe.engine?.bytesWritten === 'number' && probe.engine.bytesWritten === 8;
+  } catch {
+    return false;
+  }
+})();
+
 function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+  if (HAS_INFLATE_INFO) {
+    try {
+      const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+      const consumed = result.engine.bytesWritten;
+      if (
+        typeof consumed === 'number' && consumed > 0 && consumed <= buffer.length - offset
+        && result.buffer.length === expectedSize
+      ) {
+        return { data: result.buffer, consumed };
+      }
+    } catch {
+      // Fall through to the binary search below.
+    }
+  }
   let low = 0;
   let high = buffer.length - offset;
   const tries = (length: number): Buffer | null => {
@@ -255,14 +286,27 @@ export function parsePack(buffer: Buffer): PackEntry[] {
   return entries;
 }
 
+/**
+ * Memoised packs: a pack is a pure function of its object set (objects are
+ * immutable and content-addressed), so the identical fetch selection — the
+ * clone workload fetches the same tip 50 times — is built once. Bounded
+ * (32 entries, FIFO eviction); a miss computes normally.
+ */
+const packCache = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 32;
+
 /** Write plain (non-delta) objects as a v2 pack, entries sorted by oid. */
 export function writePack(objects: Map<string, GitObject> | GitObject[]): Buffer {
-  const list = (objects instanceof Map ? [...objects.values()] : objects).slice();
-  list.sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // Hash each object once up front: the old comparator re-hashed on every
+  // comparison (O(n log n) SHA-1s for an n-object pack).
+  const withOid = (objects instanceof Map
+    ? [...objects.entries()].map(([oid, obj]) => ({ obj, oid }))
+    : objects.map((obj) => ({ obj, oid: hashObject(obj.type, obj.data) })));
+  withOid.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+  const cacheKey = withOid.map((entry) => entry.oid).join('\n');
+  const cached = packCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const list = withOid.map((entry) => entry.obj);
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 4, 'ascii');
@@ -288,7 +332,13 @@ export function writePack(objects: Map<string, GitObject> | GitObject[]): Buffer
   }
   const withoutTrailer = Buffer.concat(parts);
   const trailer = createHash('sha1').update(withoutTrailer).digest();
-  return Buffer.concat([withoutTrailer, trailer]);
+  const pack = Buffer.concat([withoutTrailer, trailer]);
+  if (packCache.size >= PACK_CACHE_MAX) {
+    const oldest = packCache.keys().next();
+    if (!oldest.done) packCache.delete(oldest.value);
+  }
+  packCache.set(cacheKey, pack);
+  return pack;
 }
 
 // ---------------------------------------------------------------------------
